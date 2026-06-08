@@ -1,0 +1,40 @@
+{
+  "name": "@rfcx/s3-storage-client",
+  "version": "1.0.0",
+  "description": "Thin, endpoint-aware AWS S3 client factory that routes all S3 access through the in-cluster s3-proxy (s3-reader/s3-writer chain) when AWS_S3_ENDPOINT is set. Does NOT reimplement any reader/writer logic; it only constructs the SDK client so it talks to the proxy (or default AWS when unset).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "jest"
+  },
+  "keywords": [
+    "rfcx",
+    "s3",
+    "minio",
+    "s3-reader",
+    "s3-writer",
+    "storage"
+  ],
+  "author": "RFCx",
+  "license": "ISC",
+  "homepage": "https://github.com/rfcx/s3-storage-client#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rfcx/s3-storage-client.git"
+  },
+  "peerDependencies": {
+    "aws-sdk": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "aws-sdk": {
+      "optional": true
+    },
+    "@aws-sdk/client-s3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "aws-sdk": "^2.1388.0",
+    "jest": "^27.2.5"
+  }
+}
