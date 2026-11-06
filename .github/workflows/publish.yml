@@ -1,0 +1,135 @@
+name: Publish (GitHub Packages)
+# @rfcx/* packages are published to GitHub Packages (npm.pkg.github.com), PRIVATE to the rfcx org.
+# The public npm scope @rfcx is owned by a personal npm account no longer available, so npmjs.org is
+# NOT a publish target any more (the old NPM_PUBLISH_TOKEN workflow is retired; rfcx-local
+# runbooks/DESIGN-2026-11-05-shared-recording-metadata-parser.md §9, migration 2026-11-05).
+#
+# - push of a tag  -> pack that tag and publish it (version must equal the tag name).
+# - workflow_dispatch:
+#     mirror-npm-versions: copy versions BYTE-EXACT from registry.npmjs.org (same sha512 integrity, so
+#                          consumers' lockfile `integrity` stays valid; only `resolved` changes).
+#     from-tags:           pack + publish these git tags (for versions that were never on npmjs.org).
+#     force-version-to-tag: set package.json version := tag before packing (ONLY for a tag whose
+#                          package.json was not bumped, e.g. message-queue 1.1.1 -> says 1.1.0).
+# Idempotent: a version already on GitHub Packages is verified and skipped, never overwritten.
+# Auth: this repo's own GITHUB_TOKEN (packages: write) -- no personal token.
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      mirror-npm-versions:
+        description: 'Space-separated versions to mirror byte-exact from registry.npmjs.org'
+        required: false
+        default: ''
+      from-tags:
+        description: 'Space-separated git tags to pack + publish'
+        required: false
+        default: ''
+      force-version-to-tag:
+        description: 'Set package.json version to the tag name before packing (from-tags only)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@rfcx'
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIRROR: ${{ github.event_name == 'workflow_dispatch' && inputs.mirror-npm-versions || '' }}
+          EVENT: ${{ github.event_name }}
+          IN_TAGS: ${{ inputs.from-tags }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          FORCE: ${{ inputs.force-version-to-tag || false }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then FROM_TAGS="$PUSHED_TAG"; else FROM_TAGS="$IN_TAGS"; fi
+          GH=https://npm.pkg.github.com
+          PKG=$(node -p "require('./package.json').name")
+          BASE=${PKG#*/}
+          ENC=${PKG/\//%2f}
+          WORK=$(mktemp -d)
+          SUMMARY="$WORK/summary.tsv"
+          : > "$SUMMARY"
+          gh_integrity() {  # $1=version -> integrity on GitHub Packages, or empty
+            curl -sf -H "Authorization: Bearer $NODE_AUTH_TOKEN" "$GH/$ENC" \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=(JSON.parse(s).versions||{})['$1'];process.stdout.write(v?v.dist.integrity:'')})" || true
+          }
+          tgz_integrity() { echo "sha512-$(openssl dgst -sha512 -binary "$1" | base64 -w0)"; }
+
+          # ---- mirror byte-exact from npmjs.org (ascending semver so `latest` ends on the highest) ----
+          for V in $(printf '%s\n' $MIRROR | sort -t. -k1,1n -k2,2n -k3,3n); do
+            WANT=$(npm view "$PKG@$V" dist.integrity --registry https://registry.npmjs.org)
+            [ -n "$WANT" ] || { echo "::error::$PKG@$V not on npmjs.org"; exit 1; }
+            HAVE=$(gh_integrity "$V")
+            if [ -n "$HAVE" ]; then
+              [ "$HAVE" = "$WANT" ] || { echo "::error::$PKG@$V already on GH with DIFFERENT integrity"; exit 1; }
+              echo "skip $V (already on GH, integrity equal)"; printf 'mirror\t%s\t%s\tskipped-equal\n' "$V" "$HAVE" >> "$SUMMARY"; continue
+            fi
+            T="$WORK/$BASE-$V.tgz"
+            curl -sfL "https://registry.npmjs.org/$PKG/-/$BASE-$V.tgz" -o "$T"
+            GOT=$(tgz_integrity "$T")
+            [ "$GOT" = "$WANT" ] || { echo "::error::$V download integrity mismatch"; exit 1; }
+            npm publish "$T" --registry "$GH" --ignore-scripts
+            PUB=$(gh_integrity "$V")
+            [ "$PUB" = "$WANT" ] || { echo "::error::$V published integrity $PUB != npmjs.org $WANT"; exit 1; }
+            printf 'mirror\t%s\t%s\tpublished-equal-to-npmjs\n' "$V" "$PUB" >> "$SUMMARY"
+          done
+
+          # ---- pack + publish git tags ----
+          for TAG in $FROM_TAGS; do
+            git checkout -q "refs/tags/$TAG"
+            V=$(node -p "require('./package.json').version")
+            if [ "$V" != "$TAG" ]; then
+              if [ "$FORCE" = "true" ]; then
+                echo "::warning::tag $TAG package.json says $V -> forcing version $TAG (documented override)"
+                npm version "$TAG" --no-git-tag-version --allow-same-version >/dev/null
+                V=$TAG
+              else
+                echo "::error::tag $TAG but package.json version $V (use force-version-to-tag)"; exit 1
+              fi
+            fi
+            HAVE=$(gh_integrity "$V")
+            if [ -n "$HAVE" ]; then echo "skip $V (already on GH: $HAVE)"; printf 'tag\t%s\t%s\tskipped-exists\n' "$V" "$HAVE" >> "$SUMMARY"; git checkout -q -- . ; continue; fi
+            if node -e "const s=require('./package.json').scripts||{};process.exit(s.prepack||s.prepare||s.build?0:1)"; then
+              if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+            fi
+            T=$(npm pack --pack-destination "$WORK" | tail -1)
+            # a build step must reproduce what the tag committed (e.g. lib/): no tracked file may change
+            git diff --stat --exit-code -- . ':(exclude)package.json' ':(exclude)package-lock.json' \
+              || { echo "::error::packing tag $TAG modified tracked files (non-reproducible build)"; exit 1; }
+            npm publish "$WORK/$T" --registry "$GH" --ignore-scripts
+            PUB=$(gh_integrity "$V")
+            [ "$PUB" = "$(tgz_integrity "$WORK/$T")" ] || { echo "::error::$V published integrity mismatch"; exit 1; }
+            printf 'tag\t%s\t%s\tpublished-from-%s\n' "$V" "$PUB" "$(git rev-parse --short=12 HEAD)" >> "$SUMMARY"
+            git checkout -q -- . ; git clean -qfdx -e node_modules
+          done
+
+          # `latest` must end on the highest version whatever order things were published in
+          HIGH=$(curl -sf -H "Authorization: Bearer $NODE_AUTH_TOKEN" "$GH/$ENC" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const c=(a,b)=>{const x=a.split('.').map(Number),y=b.split('.').map(Number);for(let i=0;i<3;i++)if(x[i]!==y[i])return x[i]-y[i];return 0};console.log(Object.keys(JSON.parse(s).versions).sort(c).pop())})")
+          npm dist-tag add "$PKG@$HIGH" latest --registry "$GH"
+          echo "## $PKG on GitHub Packages" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"; cat "$SUMMARY" | tee -a "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "dist-tags: $(curl -sf -H "Authorization: Bearer $NODE_AUTH_TOKEN" "$GH/$ENC" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log(JSON.stringify(j['dist-tags']),Object.keys(j.versions).join(' '))})")"
+      - name: Package visibility (informational; must read private)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PKG=$(node -p "require('./package.json').name" 2>/dev/null || true)
+          gh api "orgs/rfcx/packages/npm/${PKG#*/}" --jq '"visibility=\(.visibility) repo=\(.repository.full_name // "none")"' || echo "visibility: not readable with GITHUB_TOKEN"
