@@ -74,7 +74,9 @@ jobs:
 
           # ---- mirror byte-exact from npmjs.org (ascending semver so `latest` ends on the highest) ----
           for V in $(printf '%s\n' $MIRROR | sort -t. -k1,1n -k2,2n -k3,3n); do
-            WANT=$(npm view "$PKG@$V" dist.integrity --registry https://registry.npmjs.org)
+            # NOT `npm view --registry`: setup-node's `@rfcx:registry` scope line OVERRIDES --registry for
+            # scoped names, so that silently queried GitHub Packages (measured 2026-11-05: a vacuous GH==GH "equal").
+            WANT=$(curl -sf "https://registry.npmjs.org/${ENC}/$V" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).dist.integrity||''))" || true)
             [ -n "$WANT" ] || { echo "::error::$PKG@$V not on npmjs.org"; exit 1; }
             HAVE=$(gh_integrity "$V")
             if [ -n "$HAVE" ]; then
