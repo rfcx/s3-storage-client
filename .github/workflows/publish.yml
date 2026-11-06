@@ -128,6 +128,18 @@ jobs:
           echo "## $PKG on GitHub Packages" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"; cat "$SUMMARY" | tee -a "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "dist-tags: $(curl -sf -H "Authorization: Bearer $NODE_AUTH_TOKEN" "$GH/$ENC" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log(JSON.stringify(j['dist-tags']),Object.keys(j.versions).join(' '))})")"
+      - name: Registry manifest (every version on GitHub Packages)
+        if: success()
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PKG=$(node -p "require('./package.json').name")
+          curl -sf -H "Authorization: Bearer $NODE_AUTH_TOKEN" "https://npm.pkg.github.com/${PKG/\//%2f}" > /tmp/meta.json
+          node -e '
+            const m=require("/tmp/meta.json");
+            for (const [v,x] of Object.entries(m.versions)) console.log("MANIFEST\t"+[m.name,v,x.dist.shasum,x.dist.integrity,x.dist.tarball,JSON.stringify(x.dependencies||{}),JSON.stringify(x.peerDependencies||{}),JSON.stringify(x.engines||{})].join("\t"));
+            console.log("MANIFEST-DIST-TAGS\t"+JSON.stringify(m["dist-tags"]));
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Package visibility (informational; must read private)
         if: always()
         env:
